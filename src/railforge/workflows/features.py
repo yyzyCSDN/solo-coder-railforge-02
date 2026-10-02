@@ -11,8 +11,14 @@ from railforge.inventory.wagon_pool import allocate
 from railforge.intermodal.connections import choose as choose_connection
 from railforge.maintenance.release import releasable
 from railforge.possession.windows import conflicts as possession_conflicts
+from railforge.planning.cycle_repair import (commit_state, insert_repair, state_from_dict,
+                                             state_to_dict, windows_from_state)
 from railforge.planning.loco_circulation import circulate
 from railforge.planning.train_path_engine import build, section_load, train_delay
+
+LOCO_CYCLE_KIND = "loco_cycle_state"
+LOCO_CYCLE_TOPIC = "feature.loco.cycle_committed"
+LOCO_REPAIR_TOPIC = "feature.loco.repair_inserted"
 from railforge.routing.clearance import route_ok
 from railforge.signaling.block_occupancy import conflicts as block_conflicts
 from railforge.yard.hump import classify
@@ -145,4 +151,70 @@ class RailForgeFeatureService:
             accepted = [consumer.accept(e) for e in events]
             return {"accepted": accepted, "delay": fused_delay(observations, max_lateness)}
         return self.control.run(operation_id, "feature.timeline.reconciled", operation_id, at, action)
+
+    def _loco_cycle_states(self):
+        states = {}
+        for subject, row in self.control.store.snapshot().items():
+            value = row.value
+            if isinstance(value, dict) and value.get("kind") == LOCO_CYCLE_KIND:
+                states[subject] = value["state"]
+        return states
+
+    def _loco_cycle_windows(self, exclude):
+        windows = []
+        for subject, raw in self._loco_cycle_states().items():
+            if subject != exclude:
+                windows.extend(windows_from_state(state_from_dict(raw)))
+        return tuple(windows)
+
+    def commit_loco_cycle(self, operation_id, cycle_id, legs, units, turn_minutes,
+                          adhesion_factor, evidence, policy, existing, at):
+        """Commit a locomotive cycle in one version boundary: traction capacity,
+        unit availability, maintenance evidence, round-trip turnover and the
+        existing train plan (explicit windows plus every other committed cycle)
+        are validated together, and the commit is all-or-nothing."""
+        def action():
+            if cycle_id in self._loco_cycle_states():
+                raise ValueError("cycle already committed")
+            reservations = tuple(existing or ()) + self._loco_cycle_windows(exclude=cycle_id)
+            state = commit_state(legs, units, turn_minutes, adhesion_factor,
+                                 evidence, policy, reservations)
+            return {"kind": LOCO_CYCLE_KIND, "cycle_id": cycle_id, "state": state_to_dict(state),
+                    "assignments": {k: list(v) for k, v in sorted(state.assignments.items())},
+                    "released": list(state.released)}
+        return self.control.run(operation_id, LOCO_CYCLE_TOPIC, cycle_id, at, action)
+
+    def insert_unplanned_repair(self, operation_id, cycle_id, order, strategy, at):
+        """Insert an unplanned repair into a committed cycle.
+
+        The impact on previously committed legs is always explicit in the
+        receipt; the caller chooses PRESERVE_FEASIBLE (keep the legs that can
+        still run, release the rest by name) or ROLLBACK (raise RepairConflict
+        and leave the committed state untouched)."""
+        def action():
+            committed = self._loco_cycle_states()
+            if cycle_id not in committed:
+                raise ValueError("unknown cycle")
+            state = state_from_dict(committed[cycle_id])
+            external = self._loco_cycle_windows(exclude=cycle_id)
+            new_state, outcome = insert_repair(state, order, strategy, external)
+            return {"kind": LOCO_CYCLE_KIND, "cycle_id": cycle_id,
+                    "state": state_to_dict(new_state), "repair": order.order_id,
+                    "strategy": strategy, "duplicate": outcome["duplicate"],
+                    "impacted": list(outcome["impacted"]),
+                    "reassigned": {k: list(v) for k, v in outcome["reassigned"].items()},
+                    "released": list(outcome["released"])}
+        return self.control.run(operation_id, LOCO_REPAIR_TOPIC, cycle_id, at, action)
+
+    def replay_loco_cycle(self, cycle_id):
+        """Rebuild the cycle state by folding its committed events in sequence
+        order; returns None when the cycle has no committed events."""
+        state = None
+        for event in self.control.stream.snapshot():
+            if event.subject != cycle_id or event.topic not in (LOCO_CYCLE_TOPIC, LOCO_REPAIR_TOPIC):
+                continue
+            result = event.payload.get("result")
+            if isinstance(result, dict) and "state" in result:
+                state = result["state"]
+        return state
 
